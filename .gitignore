@@ -33,7 +33,6 @@ logs/
 # Claude / AI session state
 .claude/
 CLAUDE.md
-PROGRESS.md
 
 # Local deploy output (mvn install target)
 current/
