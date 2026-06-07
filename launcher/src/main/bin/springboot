@@ -1,0 +1,182 @@
+#!/bin/bash
+#
+# Spring Boot 启停脚本 — agentscope-router
+#
+# 在 `mvn -DskipTests install` 之后, maven-antrun-plugin 会把
+#   target/bin/springboot
+#   target/agentscope-router.jar
+# 一起拷贝到 ../current/. 此脚本与 jar 部署在同一目录, 之后:
+#
+#   cd current/
+#   ./springboot start | stop | restart | status | help
+#
+# 可通过以下环境变量覆盖默认值:
+#   SERVER_PORT  HTTP 监听端口, 默认 8080
+#   JAVA_OPTS    JVM 参数, 默认 "-Xms512m -Xmx1024m -XX:+UseG1GC"
+#   LOG_DIR      Spring 日志输出目录, 默认脚本同目录的 logs/
+#                (Log4j2 已接管, 同时写 logs/agentscope-router.log + logs/demo.log)
+#   SPRING_PROFILES_ACTIVE  激活的 profile, 例如 smoke / pro
+
+set -u
+
+# ---- Configuration ---------------------------------------------------
+
+APP_NAME="agentscope-router"
+JAR_FILE="agentscope-router.jar"
+
+SERVER_PORT="${SERVER_PORT:-8080}"
+JAVA_OPTS="${JAVA_OPTS:--Xms512m -Xmx1024m -XX:+UseG1GC}"
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JAR_PATH="${BIN_DIR}/${JAR_FILE}"
+PID_FILE="${BIN_DIR}/${APP_NAME}.pid"
+LOG_DIR="${LOG_DIR:-${BIN_DIR}/logs}"
+
+# ---- Colors ---------------------------------------------------------
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# ---- Helpers --------------------------------------------------------
+
+check_pid() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid=$(cat "${PID_FILE}")
+        if [ -n "${pid}" ] && ps -p "${pid}" > /dev/null 2>&1; then
+            PID="${pid}"
+            return 0
+        else
+            rm -f "${PID_FILE}"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+start() {
+    if check_pid; then
+        log_warn "${APP_NAME} is already running (PID: ${PID})"
+        return 1
+    fi
+
+    if [ ! -f "${JAR_PATH}" ]; then
+        log_error "JAR file not found: ${JAR_PATH}"
+        log_error "Run 'mvn -B -DskipTests install' first, or check the deploy dir."
+        return 1
+    fi
+
+    if [ ! -d "${LOG_DIR}" ]; then
+        mkdir -p "${LOG_DIR}"
+    fi
+
+    log_info "Starting ${APP_NAME} on port ${SERVER_PORT} (logs: ${LOG_DIR})..."
+
+    nohup java ${JAVA_OPTS} \
+        -Dspring.profiles.active="${SPRING_PROFILES_ACTIVE:-}" \
+        -Dserver.port="${SERVER_PORT}" \
+        -Dlogging.file.path="${LOG_DIR}" \
+        -jar "${JAR_PATH}" \
+        > /dev/null 2>&1 &
+
+    local new_pid=$!
+    echo "${new_pid}" > "${PID_FILE}"
+
+    sleep 2
+
+    if check_pid; then
+        log_info "${APP_NAME} started successfully (PID: ${PID})"
+        log_info "  Health: curl -s http://localhost:${SERVER_PORT}/api/v1/health"
+    else
+        log_error "Failed to start ${APP_NAME} (check ${LOG_DIR}/agentscope-router.log)"
+        rm -f "${PID_FILE}"
+        return 1
+    fi
+}
+
+stop() {
+    if ! check_pid; then
+        log_warn "${APP_NAME} is not running"
+        return 1
+    fi
+
+    log_info "Stopping ${APP_NAME} (PID: ${PID})..."
+
+    kill "${PID}"
+
+    for _ in $(seq 1 30); do
+        if ! ps -p "${PID}" > /dev/null 2>&1; then
+            rm -f "${PID_FILE}"
+            log_info "${APP_NAME} stopped successfully"
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_warn "Force killing ${APP_NAME}..."
+    kill -9 "${PID}"
+    rm -f "${PID_FILE}"
+    log_info "${APP_NAME} killed"
+}
+
+restart() {
+    stop
+    sleep 2
+    start
+}
+
+status() {
+    if check_pid; then
+        log_info "${APP_NAME} is running (PID: ${PID})"
+        log_info "  Port: ${SERVER_PORT}   Logs: ${LOG_DIR}"
+    else
+        log_warn "${APP_NAME} is not running"
+        return 1
+    fi
+}
+
+help() {
+    cat <<EOF
+Usage: $0 {start|stop|restart|status|help}
+
+Commands:
+  start    Start ${APP_NAME} in the background (writes pid to ${PID_FILE})
+  stop     Stop the running instance (SIGTERM, then SIGKILL after 30s)
+  restart  Stop, sleep 2, then start
+  status   Report whether the app is running
+  help     Show this message
+
+Environment overrides:
+  SERVER_PORT             HTTP port (default 8080)
+  JAVA_OPTS               JVM options
+  LOG_DIR                 Log output directory
+  SPRING_PROFILES_ACTIVE  Spring profile(s), e.g. smoke
+
+Examples:
+  SERVER_PORT=9090 ./springboot start
+  SPRING_PROFILES_ACTIVE=smoke MINIMAX_API_KEY=xxx ./springboot start
+  ./springboot stop
+EOF
+}
+
+# ---- Dispatcher -----------------------------------------------------
+
+case "${1:-help}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) restart ;;
+    status)  status ;;
+    help|-h|--help) help ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|help}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

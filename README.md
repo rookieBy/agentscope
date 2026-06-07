@@ -533,6 +533,358 @@ mvn -B -pl llm test
 - ❌ MySQL 持久化
 - ❌ 自定义 Function Calling 协议（用 AgentScope 内置 `@Tool`）
 
+## Controller API Reference
+
+所有业务端点强制要求 `X-Tenant-Id` 请求头（regex `[a-zA-Z0-9_-]{1,64}`，缺失或非法一律返回 400 `MISSING_TENANT_ID` / `INVALID_TENANT_ID`）。SSE 端点的响应是 `text/event-stream`，每条事件独占一行 `data: { ...json... }\n\n`。
+
+下文示例默认服务监听 `http://localhost:8080`，tenant id 取 `demo-tenant-1`。
+
+### `HealthController` — `/api/v1/health`
+
+Liveness 探针，**不**访问任何 LLM provider，K8s / LB 健康检查可直接打。
+
+| Method | Path | Headers | 用途 |
+|---|---|---|---|
+| `GET` | `/api/v1/health` | — | 服务存活 + 元信息 |
+
+**响应 200**
+
+```json
+{
+  "status": "UP",
+  "service": "agentscope-router",
+  "timestamp": "2026-06-07T13:00:00Z"
+}
+```
+
+**示例**
+
+```bash
+curl -s http://localhost:8080/api/v1/health
+```
+
+---
+
+### `RoutingController` — `/api/v1/routing/*`
+
+只读路由内省。所有路由都通过 `X-Tenant-Id` 区分租户（由 `TenantContextFilter` 写入 `TenantContextHolder`）。
+
+#### `GET /api/v1/routing/candidates`
+
+返回当前注册的全部 `(providerId, modelName)` 候选清单，**不**带租户隔离（registry 是进程级共享的）。
+
+**响应 200**
+
+```json
+{
+  "qualifiedNames": ["minimax:abab6.5s-chat", "openai:gpt-4o-mini", "dashscope:qwen-plus"],
+  "count": 3,
+  "timestamp": "2026-06-07T13:00:00Z"
+}
+```
+
+**示例**
+
+```bash
+curl -s -H "X-Tenant-Id: demo-tenant-1" http://localhost:8080/api/v1/routing/candidates
+```
+
+#### `GET /api/v1/routing/status`
+
+按租户返回各候选模型的健康度快照（EMA + 滑动窗口 + 连续失败冷却，由 `HealthScoreService` 计算）。
+
+**Headers**：`X-Tenant-Id`（必填）
+
+**响应 200**
+
+```json
+{
+  "tenantId": "demo-tenant-1",
+  "candidateCount": 3,
+  "candidates": [
+    {
+      "qualifiedName": "minimax:abab6.5s-chat",
+      "score": 0.95,
+      "consecutiveFailures": 0,
+      "lastFailureAt": null,
+      "cooldownUntil": null,
+      "samples": 42
+    }
+  ],
+  "timestamp": "2026-06-07T13:00:00Z"
+}
+```
+
+**示例**
+
+```bash
+curl -s -H "X-Tenant-Id: demo-tenant-1" http://localhost:8080/api/v1/routing/status
+```
+
+---
+
+### `ChatController` — `/api/v1/chat/*`
+
+流式聊天。**两条端点**都返回 `text/event-stream`，每条事件格式：`data: {"type":"...","...":"..."}\n\n`。
+
+#### `POST /api/v1/chat/stream`
+
+直接调 `RoutingChatModel`，由路由层按 TTFT 阈值 + 健康度做多 provider 切换。每次模型产出 `ChatResponse` 即推送一条 `data:` 事件，**不**经过 ReAct agent / `@Tool`。
+
+**Headers**：`X-Tenant-Id`（必填）  
+**Body**（`application/json`）：
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "你是一个简洁的助手。"},
+    {"role": "user",   "content": "用一句话介绍 Spring Boot 3"}
+  ]
+}
+```
+
+- `messages[]` 必填，至少一条；非空 OpenAI 形态（`role` + `content`）
+- 整段响应被路由到**单个** provider（无 TTFT 超时时切到下一个候选）
+
+**SSE chunk 形态**
+
+```json
+{ "type": "model", "model": "minimax:abab6.5s-chat", "content": "Spring Boot 3 是..." }
+```
+
+**示例**
+
+```bash
+curl -N \
+  -H "X-Tenant-Id: demo-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"你好"}]}' \
+  http://localhost:8080/api/v1/chat/stream
+```
+
+#### `POST /api/v1/chat/agent/stream`
+
+走 `ReActAgent`：`RoutingChatModel` 作为底座 chat model，agent 会按需调用 `MediaTools` 里注册的 `@Tool`（`text_to_image` / `text_to_video` / `query_video_task` / `download_video_file` 等）。每个 agent 事件（`REASONING` / `TOOL_RESULT` / `AGENT_RESULT` / `TOOL_CALL`）会独立推送一条 SSE chunk。
+
+**Headers**：`X-Tenant-Id`（必填）  
+**Body**：
+
+```json
+{ "message": "用一句话介绍 Spring Boot 3" }
+```
+
+- `message` 必填，非空字符串
+- 工具调用跨 async 边界时，`ChatAgentService` 会把 `tenantId` 注入到 `Msg.metadata` + `MediaTools` 上下文（`ToolContext`），`@Tool` 内部统一从 `MediaTools.getCurrentRequest()` 读租户
+
+**示例**
+
+```bash
+curl -N \
+  -H "X-Tenant-Id: demo-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"给我生成一张猫咪的图片"}' \
+  http://localhost:8080/api/v1/chat/agent/stream
+```
+
+---
+
+### `MediaController` — `/api/v1/media/*`
+
+直接的多模态 HTTP 端点（与 `MediaTools` 上的 `@Tool` 并行存在，便于不想付 LLM token 的前端/调用方绕开 agent）。所有路由强制 `X-Tenant-Id`。
+
+#### `POST /api/v1/media/image`
+
+同步文生图。`MultimodalService` 直接调底层图像 provider，**不**经过路由切换。
+
+**Headers**：`X-Tenant-Id`（必填）、`Content-Type: application/json`  
+**Body**：
+
+```json
+{
+  "prompt": "A cute calico cat sitting on a window sill, watercolor",
+  "aspectRatio": "16:9",
+  "n": 1
+}
+```
+
+- `prompt` 必填，非空
+- `aspectRatio`、`n` 选填；具体取值由 provider 决定
+
+**响应 200**
+
+```json
+{
+  "model": "minimax:image-01",
+  "imageUrls": ["https://.../cat-1.png"]
+}
+```
+
+**示例**
+
+```bash
+curl -s \
+  -H "X-Tenant-Id: demo-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a sunset over the sea","aspectRatio":"16:9","n":1}' \
+  http://localhost:8080/api/v1/media/image
+```
+
+#### `POST /api/v1/media/video`
+
+异步文生视频。提交后立即返回 `taskId`，后续通过 `GET /api/v1/media/video/{taskId}` 查状态，或 `GET /api/v1/media/video/{taskId}/stream` 订阅 SSE 进度。视频任务状态机：`PENDING → QUEUED → RUNNING → SUCCEEDED | FAILED`。
+
+**Headers**：`X-Tenant-Id`（必填）、`Content-Type: application/json`  
+**Body**：
+
+```json
+{
+  "prompt": "A drone shot rising over a misty forest at dawn",
+  "duration": 6,
+  "resolution": "1080P",
+  "firstFrameImageUrl": ""
+}
+```
+
+- `prompt` 必填，非空
+- `duration` 选填，单位秒；当前 provider（Hailuo-2.3）仅支持 `6` / `10`
+- `resolution` 选填，如 `720P` / `1080P`
+- `firstFrameImageUrl` 选填，图生视频时使用
+
+**响应 200**
+
+```json
+{
+  "taskId": "t:abc123:video:xyz",
+  "state": "PENDING",
+  "model": "minimax:hailuo-2.3",
+  "createdAt": "2026-06-07T13:00:00Z"
+}
+```
+
+**示例**
+
+```bash
+curl -s \
+  -H "X-Tenant-Id: demo-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a corgi running on the beach","duration":6,"resolution":"1080P"}' \
+  http://localhost:8080/api/v1/media/video
+```
+
+#### `GET /api/v1/media/video/{taskId}`
+
+查询视频任务当前快照。租户隔离：跨租户查一律返回 404 `VIDEO_TASK_NOT_FOUND`（**不会**返回空数据，避免存在性泄漏）。
+
+**Headers**：`X-Tenant-Id`（必填）  
+**Path 参数**：`taskId`（非空）
+
+**响应 200**
+
+```json
+{
+  "taskId": "t:abc123:video:xyz",
+  "state": "RUNNING",
+  "model": "minimax:hailuo-2.3",
+  "videoUrl": null,
+  "fileId": null,
+  "failureReason": null,
+  "createdAt": "2026-06-07T13:00:00Z",
+  "updatedAt": "2026-06-07T13:00:42Z"
+}
+```
+
+`SUCCEEDED` 时 `videoUrl` 是 provider 返回的下载链接（worker 会先调 `retrieveFileDownloadUrl(fileId)`）；`FAILED` 时 `failureReason` 是 provider 错误信息。
+
+**示例**
+
+```bash
+curl -s -H "X-Tenant-Id: demo-tenant-1" \
+  http://localhost:8080/api/v1/media/video/t:abc123:video:xyz
+```
+
+#### `GET /api/v1/media/video/{taskId}/stream`
+
+SSE 订阅视频任务状态变化。第一条事件是**当前**快照（任务不存在时推 `{"type":"NOT_FOUND","message":"..."}`），后续事件由 `VideoTaskWorker` 每次轮询到状态变化时通过 Redis Pub/Sub 推过来。流在 `SUCCEEDED` / `FAILED` 时自动关闭。
+
+**Headers**：`X-Tenant-Id`（必填）  
+**Path 参数**：`taskId`（非空）
+
+**SSE chunk 形态**
+
+```json
+{ "type": "PENDING",   "task": { ... } }
+{ "type": "RUNNING",   "task": { ... } }
+{ "type": "SUCCEEDED", "task": { ..., "videoUrl": "https://..." } }
+```
+
+**示例**
+
+```bash
+curl -N -H "X-Tenant-Id: demo-tenant-1" \
+  http://localhost:8080/api/v1/media/video/t:abc123:video:xyz/stream
+```
+
+---
+
+### `DemoController` — `/api/v1/demo/ai-promo`
+
+**多 Agent 协同 Demo**（受 `agentscope.demo.ai-promo.enabled=true` 控制开关，关闭时整个 controller 不注册 → 端点 404）。该端点串联展示 AgentScope 的 ReAct + `@Tool` 协作流：
+
+```
+user prompt
+  → Agent (decides)
+  → write_promo_copy (@Tool)        写一段推广文案
+  → text_to_video   (@Tool)         调 minimax Hailuo-2.3 生成视频
+  → query_video_task(@Tool)         轮询到 SUCCEEDED
+  → download_video_file(@Tool)      拉回 videoUrl
+  → final result                    SSE 推送给客户端
+```
+
+每条 agent 事件独立推送一条 SSE chunk，与 `/api/v1/chat/agent/stream` 共用一套前端解析。
+
+#### `POST /api/v1/demo/ai-promo`
+
+**Headers**：`X-Tenant-Id`（必填）、`Content-Type: application/json`  
+**Body**：
+
+```json
+{
+  "topic": "智能保温杯，让冬日办公更有温度",
+  "duration": 6,
+  "language": "zh"
+}
+```
+
+- `topic` 必填，非空；产品/推广主题
+- `duration` 选填，单位秒；受 Hailuo-2.3 限制仅接受 `6` / `10`，不传则取 `agentscope.demo.ai-promo.default-duration`（默认 6）
+- `language` 选填，文案输出语言（如 `zh` / `en`），空字符串等同于 `en`
+
+**示例**
+
+```bash
+curl -N \
+  -H "X-Tenant-Id: demo-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"topic":"智能保温杯","duration":6,"language":"zh"}' \
+  http://localhost:8080/api/v1/demo/ai-promo
+```
+
+---
+
+### 公共错误码（节选）
+
+| HTTP | `code` | 触发条件 |
+|---|---|---|
+| 400 | `MISSING_TENANT_ID` | `X-Tenant-Id` 头缺失 |
+| 400 | `INVALID_TENANT_ID` | `X-Tenant-Id` 不符合 `[a-zA-Z0-9_-]{1,64}` 或 body 字段非法 |
+| 400 | `INVALID_VIDEO_DURATION` | `duration` 不是 `{6, 10}`（仅 `ai-promo`） |
+| 404 | `VIDEO_TASK_NOT_FOUND` | 视频任务对当前租户不可见 |
+| 500 | `INTERNAL_ERROR` | 兜底；详见 `logs/agentscope-router.log` |
+
+完整错误码定义见 `common/src/main/java/io/agentscope/router/common/exception/ErrorCode.java`。
+
+---
+
 ## License
 
 MIT

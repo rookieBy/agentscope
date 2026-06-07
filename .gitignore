@@ -34,3 +34,11 @@ logs/
 .claude/
 CLAUDE.md
 PROGRESS.md
+
+# Local deploy output (mvn install target)
+current/
+
+# WSL+Windows path-corruption residue: when maven was pointed at a Windows
+# local repo on /mnt/d, WSL treated backslashes as part of the filename and
+# created a literal directory here. Safe to delete if it ever resurfaces.
+D:\\software_install\\maven\\maven-repository-3.9.11/

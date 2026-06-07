@@ -63,6 +63,48 @@
     <build>
         <finalName>agentscope-router</finalName>
         <plugins>
+            <!-- 1. clean-plugin: mvn clean 时同时清空 ../current 部署目录 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-clean-plugin</artifactId>
+                <configuration>
+                    <filesets>
+                        <fileset>
+                            <directory>./target/</directory>
+                        </fileset>
+                        <fileset>
+                            <directory>../current</directory>
+                        </fileset>
+                    </filesets>
+                </configuration>
+            </plugin>
+
+            <!-- 2. resources-plugin: package 阶段把 src/main/bin 拷贝到 target/bin,
+                    antrun 阶段再把 target/bin 复制到 ../current/ -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-startup-script</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>./target/bin</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>./src/main/bin</directory>
+                                    <filtering>true</filtering>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 3. spring-boot-maven-plugin: 生成可执行 fat jar -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
@@ -79,6 +121,35 @@
                         <goals>
                             <goal>repackage</goal>
                         </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 4. antrun-plugin: 把 target/*.jar + target/bin/springboot 一并拷到 ../current/,
+                    'mvn install' 之后直接 cd current/ && java -jar 即可运行 -->
+            <plugin>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-package-to-current</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <copy todir="../current" overwrite="true">
+                                    <fileset dir="./target/bin">
+                                        <include name="springboot"/>
+                                    </fileset>
+                                    <fileset dir="./target">
+                                        <include name="*.jar"/>
+                                    </fileset>
+                                </copy>
+                                <!-- <copy> 不保留执行位; 显式 chmod, 让 ./springboot start 可直接运行 -->
+                                <chmod file="../current/springboot" perm="755"/>
+                            </target>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>
