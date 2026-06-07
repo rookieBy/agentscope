@@ -1,0 +1,36 @@
+# Build outputs
+target/
+build/
+out/
+*.class
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets — never commit API keys
+**/application-local.yml
+**/application-local*.yml
+**/.env
+**/.env.*
+
+# Logs
+*.log
+logs/
+
+# Maven
+.mvn/wrapper/maven-wrapper.jar
+
+# Claude / AI session state
+.claude/
+CLAUDE.md
+PROGRESS.md

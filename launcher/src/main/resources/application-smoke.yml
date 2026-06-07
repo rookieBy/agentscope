@@ -1,0 +1,19 @@
+# Smoke-test profile overlay. Activated via --spring.profiles.active=smoke.
+# Used by the M3 end-to-end smoke test to enable the minimax provider with
+# the platform-provided key. The base application.yml keeps providers
+# disabled by default to avoid leaking the key into committed config.
+agentscope:
+  routing:
+    # Smoke-test override: real LLM gateways (e.g. api.minimaxi.com) have a
+    # cold-start latency well above 2s, so we lift TTFT to 15s here to
+    # prevent a single cold-call from looking like a model failure. The
+    # production profile keeps the strict 2s.
+    ttft-timeout-ms: 15000
+    max-consecutive-failures: 5
+  providers:
+    minimax:
+      enabled: true
+      api-key: ${MINIMAX_API_KEY:}
+      base-url: ${MINIMAX_BASE_URL:https://api.minimaxi.com/v1}
+      models:
+        - MiniMax-M3

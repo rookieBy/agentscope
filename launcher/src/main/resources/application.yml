@@ -1,0 +1,71 @@
+spring:
+  application:
+    name: agentscope-router
+  threads:
+    virtual:
+      enabled: true                  # JDK 21 虚拟线程：SSE 推送 / Worker 轮询
+  # 禁用 AgentScope starter 的自动配置 — 路由层自己创建 ChatModel / ReActAgent，
+  # 这样可以同时持多个 provider 并实现 TTFT 切换
+  autoconfigure:
+    exclude:
+      - io.agentscope.spring.boot.AgentscopeAutoConfiguration
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+server:
+  port: ${SERVER_PORT:8080}
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when_authorized
+
+agentscope:
+  routing:
+    enabled: true
+    ttft-timeout-ms: 2000
+    health-window-size: 100
+    ema-alpha: 0.3
+    min-score-threshold: 0.05
+    max-consecutive-failures: 5
+    cooldown-ms: 30000
+  providers:
+    openai:
+      enabled: false                # 默认关闭，启动时设 enabled=true 并填 OPENAI_API_KEY
+      api-key: ${OPENAI_API_KEY:}
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com/v1}
+      models: [gpt-4o-mini]
+    dashscope:
+      enabled: false
+      api-key: ${DASHSCOPE_API_KEY:}
+      models: [qwen-plus]
+    minimax:
+      enabled: false
+      api-key: ${MINIMAX_API_KEY:}
+      base-url: ${MINIMAX_BASE_URL:https://api.minimaxi.com/v1}
+      protocol: openai-compatible
+      models: [MiniMax-M3]
+  tenants:
+    default:
+      providers: []                 # 空 = 跟随全局
+      strategy: best-score
+      rate-limit-rpm: 120
+  agent:
+    enabled: true
+    max-iterations: 5
+
+logging:
+  level:
+    root: INFO
+    io.agentscope.router: DEBUG
