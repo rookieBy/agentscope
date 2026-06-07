@@ -64,8 +64,17 @@ agentscope:
   agent:
     enabled: true
     max-iterations: 5
+  demo:
+    ai-promo:
+      enabled: false               # 关闭时不注册 AiPromoDemoService Bean,curl /api/v1/demo/ai-promo 直接 404
+      default-duration: 6          # curl 不传 duration 时的默认值
+      default-resolution: 768P
+      default-model: MiniMax-Hailuo-2.3
+      output-dir: ${DEMO_OUTPUT_DIR:business/src/main/resources/output}
 
 logging:
+  # Log4j2 接管:详细 appender / pattern / 路由见 log4j2-spring.xml.
+  # 这里只保留 Spring Boot 兼容的 level mapping,实际生效以 log4j2 配置为准.
   level:
     root: INFO
     io.agentscope.router: DEBUG

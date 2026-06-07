@@ -15,6 +15,8 @@ public enum ErrorCode {
 
     VIDEO_TASK_NOT_FOUND("VIDEO_TASK_NOT_FOUND", 404, "Video task not found for this tenant"),
     VIDEO_TASK_FORBIDDEN("VIDEO_TASK_FORBIDDEN", 403, "Video task belongs to a different tenant"),
+    INVALID_VIDEO_DURATION("INVALID_VIDEO_DURATION", 400, "Video duration must be 6 or 10 (minimax Hailuo 限制)"),
+    VIDEO_DOWNLOAD_FAILED("VIDEO_DOWNLOAD_FAILED", 502, "Failed to download generated video file"),
 
     UPSTREAM_LLM_ERROR("UPSTREAM_LLM_ERROR", 502, "Upstream LLM returned an error"),
     INTERNAL_ERROR("INTERNAL_ERROR", 500, "Internal server error");

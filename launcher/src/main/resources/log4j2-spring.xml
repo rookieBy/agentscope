@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Log4j2 configuration for agentscope-router.
+
+  Appenders:
+    - CONSOLE  : high-visibility console output with thread + logger.
+    - FILE     : rolling file (logs/agentscope-router.log), INFO+, 全局运行日志.
+    - DEMO_FILE: rolling file (logs/demo.log), TRACE+, only the demo package
+                 (io.agentscope.router.business.demo + .tools + .multimodal +
+                 .agent), 以便初学者一键 tail -f logs/demo.log 看完整 ReAct 流程.
+
+  Pattern includes %X{tenantId} so MDC-injected tenant id rides along.
+-->
+<Configuration status="WARN" monitorInterval="30">
+    <Properties>
+        <Property name="LOG_DIR">${sys:user.dir}/logs</Property>
+        <Property name="CONSOLE_PATTERN">%d{HH:mm:ss.SSS} %-5p [%t] %c{1.} - %m%n</Property>
+        <Property name="FILE_PATTERN">%d{ISO8601} %-5p [%t] [%X{tenantId:-system}] %c{2} - %m%n</Property>
+    </Properties>
+
+    <Appenders>
+        <Console name="CONSOLE" target="SYSTEM_OUT">
+            <PatternLayout pattern="${CONSOLE_PATTERN}"/>
+        </Console>
+
+        <RollingFile name="FILE"
+                     fileName="${LOG_DIR}/agentscope-router.log"
+                     filePattern="${LOG_DIR}/agentscope-router-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${FILE_PATTERN}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1"/>
+                <SizeBasedTriggeringPolicy size="50 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"/>
+        </RollingFile>
+
+        <!-- Demo 专用: 与 FILE 同目录, 名字区分; additivity=false 避免重复写到 FILE -->
+        <RollingFile name="DEMO_FILE"
+                     fileName="${LOG_DIR}/demo.log"
+                     filePattern="${LOG_DIR}/demo-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${FILE_PATTERN}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1"/>
+                <SizeBasedTriggeringPolicy size="20 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="10"/>
+        </RollingFile>
+    </Appenders>
+
+    <Loggers>
+        <!-- 第三方噪音压住 -->
+        <Logger name="org.springframework" level="INFO"/>
+        <Logger name="org.apache" level="INFO"/>
+        <Logger name="reactor" level="INFO"/>
+        <Logger name="io.netty" level="WARN"/>
+        <Logger name="io.agentscope" level="INFO"/>
+
+        <!-- 路由核心保留 DEBUG, 方便看 TTFT / candidate 选择 -->
+        <Logger name="io.agentscope.router" level="DEBUG"/>
+
+        <!--
+          Demo 专用 logger: 包含 demo / tools / multimodal / agent 四个包, 全部走 DEMO_FILE + CONSOLE,
+          初学者用 `tail -f logs/demo.log` 一条命令就能看清 ReAct 完整调用链.
+        -->
+        <Logger name="io.agentscope.router.business.demo" level="TRACE" additivity="false">
+            <AppenderRef ref="DEMO_FILE"/>
+            <AppenderRef ref="CONSOLE"/>
+        </Logger>
+        <Logger name="io.agentscope.router.business.tools" level="DEBUG" additivity="false">
+            <AppenderRef ref="DEMO_FILE"/>
+            <AppenderRef ref="CONSOLE"/>
+        </Logger>
+        <Logger name="io.agentscope.router.business.multimodal" level="DEBUG" additivity="false">
+            <AppenderRef ref="DEMO_FILE"/>
+            <AppenderRef ref="CONSOLE"/>
+        </Logger>
+        <Logger name="io.agentscope.router.business.agent" level="DEBUG" additivity="false">
+            <AppenderRef ref="DEMO_FILE"/>
+            <AppenderRef ref="CONSOLE"/>
+        </Logger>
+
+        <Root level="INFO">
+            <AppenderRef ref="CONSOLE"/>
+            <AppenderRef ref="FILE"/>
+        </Root>
+    </Loggers>
+</Configuration>

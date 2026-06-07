@@ -17,3 +17,6 @@ agentscope:
       base-url: ${MINIMAX_BASE_URL:https://api.minimaxi.com/v1}
       models:
         - MiniMax-M3
+  demo:
+    ai-promo:
+      enabled: true                 # smoke profile 下注册 AiPromoDemoService,curl 可触发
