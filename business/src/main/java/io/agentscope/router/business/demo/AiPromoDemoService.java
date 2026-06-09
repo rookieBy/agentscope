@@ -2,11 +2,13 @@ package io.agentscope.router.business.demo;
 
 import io.agentscope.core.ReActAgent;
 import io.agentscope.core.agent.Event;
+import io.agentscope.core.agent.StreamOptions;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.pipeline.MsgHub;
 import io.agentscope.router.business.tools.MediaTools;
 import io.agentscope.router.business.tools.ToolContext;
 import io.agentscope.router.common.tenant.TenantContextHolder;
@@ -24,22 +26,37 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Orchestrates the AI-promo demo end-to-end:
+ * Orchestrates the AI-promo demo end-to-end using THREE independent ReAct
+ * agents coordinated via a {@link MsgHub}:
  *
  * <ol>
- *   <li>Builds the user message with {@code topic}, {@code duration},
- *       {@code saveTo} in metadata so the agent can read them without
- *       the LLM inventing values.</li>
- *   <li>Stamps a {@link ToolContext} into
- *       {@link MediaTools#setCurrentRequest} so that tool invocations
- *       (which run on a Reactor worker thread that does not inherit the
- *       request's {@link TenantContextHolder}) can still resolve the
- *       active tenantId.</li>
- *   <li>Streams agent {@link Event}s back as a {@code Flux<Map<String,Object>>}
- *       shaped like the existing {@code /api/v1/chat/agent/stream} payload
- *       so a single client-side parser works for both endpoints.</li>
- *   <li>Clears the {@link ToolContext} on terminal signal.</li>
+ *   <li>{@code copywriterAgent} — generates the script (pure LLM).</li>
+ *   <li>{@code videoProducerAgent} — submits the video task and polls for
+ *       completion (owns {@code MediaTools} video methods).</li>
+ *   <li>{@code fileCollectorAgent} — downloads the finished .mp4 (owns
+ *       {@code PromoDemoTools.download_video_file}).</li>
  * </ol>
+ *
+ * <p>The hub uses {@code autoBroadcast=true} so that the script produced by
+ * the copywriter is automatically visible to the video producer when its
+ * turn starts, and the video producer's "SUCCEEDED" summary is in turn
+ * visible to the file collector.
+ *
+ * <p>Per-request concerns:
+ * <ul>
+ *   <li>Builds the user message with {@code topic}, {@code duration},
+ *       {@code saveTo} in metadata so the agents can read them without the
+ *       LLM inventing values.</li>
+ *   <li>Stamps a {@link ToolContext} into
+ *       {@link MediaTools#setCurrentRequest} so tool invocations on Reactor
+ *       worker threads can still resolve the active tenantId.</li>
+ *   <li>Streams agent {@link Event}s from all three agents (concatenated in
+ *       deterministic order) as a {@code Flux<Map<String,Object>>} shaped
+ *       like the existing {@code /api/v1/chat/agent/stream} payload so a
+ *       single client-side parser works for both endpoints.</li>
+ *   <li>Clears the {@link ToolContext} on terminal signal and closes the
+ *       hub on every terminal outcome.</li>
+ * </ul>
  *
  * <p>The whole bean is gated on
  * {@code agentscope.demo.ai-promo.enabled=true} via
@@ -52,11 +69,18 @@ public class AiPromoDemoService {
 
     private static final Logger log = LoggerFactory.getLogger(AiPromoDemoService.class);
 
-    private final ReActAgent promoDemoAgent;
+    private final ReActAgent copywriterAgent;
+    private final ReActAgent videoProducerAgent;
+    private final ReActAgent fileCollectorAgent;
     private final DemoProperties props;
 
-    public AiPromoDemoService(ReActAgent promoDemoAgent, DemoProperties props) {
-        this.promoDemoAgent = promoDemoAgent;
+    public AiPromoDemoService(ReActAgent copywriterAgent,
+                              ReActAgent videoProducerAgent,
+                              ReActAgent fileCollectorAgent,
+                              DemoProperties props) {
+        this.copywriterAgent = copywriterAgent;
+        this.videoProducerAgent = videoProducerAgent;
+        this.fileCollectorAgent = fileCollectorAgent;
         this.props = props;
     }
 
@@ -103,7 +127,37 @@ public class AiPromoDemoService {
                 .metadata(meta)
                 .build());
 
-        return promoDemoAgent.stream(msgs)
+        // Build the MsgHub with autoBroadcast. Entered in Flux.using so that
+        // every agent subscription sees the active hub context, and exited
+        // on every terminal outcome (success, error, cancel).
+        MsgHub hub = MsgHub.builder()
+                .name("promo-hub")
+                .participants(copywriterAgent, videoProducerAgent, fileCollectorAgent)
+                .enableAutoBroadcast(true)
+                .build();
+
+        StreamOptions opts = StreamOptions.defaults();
+
+        return Flux.using(
+                        () -> {
+                            log.info("[hub:promo-hub] enter tenant={} requestId={}",
+                                    tenantId, ctx.requestId());
+                            return hub.enter().block();
+                        },
+                        activeHub -> {
+                            log.info("[hub:promo-hub] activated tenant={} requestId={} participants={}",
+                                    tenantId, ctx.requestId(), activeHub.getParticipants().size());
+                            return Flux.concat(
+                                    copywriterAgent.stream(msgs, opts),
+                                    videoProducerAgent.stream(msgs, opts),
+                                    fileCollectorAgent.stream(msgs, opts)
+                            );
+                        },
+                        activeHub -> {
+                            log.info("[hub:promo-hub] exit tenant={} requestId={}",
+                                    tenantId, ctx.requestId());
+                            activeHub.exit().block();
+                        })
                 .doOnSubscribe(s -> {
                     log.info("[orchestrator] subscribed tenant={} requestId={}",
                             tenantId, ctx.requestId());
