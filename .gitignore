@@ -37,6 +37,9 @@ CLAUDE.md
 # Local deploy output (mvn install target)
 current/
 
+# Runtime artifacts from demo endpoints (generated MP3 / video files)
+agentscope-output/
+
 # WSL+Windows path-corruption residue: when maven was pointed at a Windows
 # local repo on /mnt/d, WSL treated backslashes as part of the filename and
 # created a literal directory here. Safe to delete if it ever resurfaces.
