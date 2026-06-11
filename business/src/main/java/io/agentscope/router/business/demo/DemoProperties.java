@@ -14,10 +14,10 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public class DemoProperties {
 
     private boolean enabled = false;
-    private int defaultDuration = 6;
+    private int defaultDuration = 10;
     private String defaultResolution = "768P";
     private String defaultModel = "MiniMax-Hailuo-2.3";
-    private String outputDir = "business/src/main/resources/output";
+    private String outputDir = "./agentscope-output";
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }

@@ -17,15 +17,14 @@ import reactor.core.publisher.Flux;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Demo endpoints that illustrate how {@code agentscope} coordinates multiple
  * agents. The whole controller is gated on
  * {@code agentscope.demo.ai-promo.enabled=true}; when the property is false
- * the class is absent and {@code POST /api/v1/demo/ai-promo} returns 404.
+ * the class is absent and {@code POST /api/v1/demo/ai-music} returns 404.
  *
- * <p>The current endpoint streams the AI-promo orchestration as SSE. Each
+ * <p>The current endpoint streams the AI-music orchestration as SSE. Each
  * chunk is a JSON object on a single {@code data:} line, so a single
  * client-side parser can handle both this endpoint and
  * {@code /api/v1/chat/agent/stream}.
@@ -37,8 +36,14 @@ public class DemoController {
 
     private static final Logger log = LoggerFactory.getLogger(DemoController.class);
 
-    /** Hailuo-2.3 only accepts these durations. */
-    private static final Set<Integer> ALLOWED_DURATIONS = Set.of(6, 10);
+    /**
+     * music-01 (synchronous) does not impose a server-side duration bound.
+     * We still cap the user input to keep lyrics length sensible and the
+     * per-request cost bounded; the cap is a soft UX guard, not a provider
+     * requirement.
+     */
+    private static final int MIN_DURATION_SEC = 1;
+    private static final int MAX_DURATION_SEC = 600;
 
     private final AiPromoDemoService aiPromoDemoService;
 
@@ -47,7 +52,7 @@ public class DemoController {
     }
 
     /**
-     * Stream the AI-promo orchestration. Same shape as the production
+     * Stream the AI-music orchestration. Same shape as the production
      * agent-stream endpoint, so a single SSE client works for both.
      *
      * <p>Validation order:
@@ -55,11 +60,11 @@ public class DemoController {
      *   <li>{@code X-Tenant-Id} present (enforced upstream by
      *       {@code TenantContextFilter}).</li>
      *   <li>{@code topic} non-blank.</li>
-     *   <li>{@code duration}, if provided, is one of {@code 6, 10}.</li>
+     *   <li>{@code duration}, if provided, in {@code [1, 600]} seconds.</li>
      * </ol>
      */
-    @PostMapping(value = "/ai-promo", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> aiPromoStream(@RequestBody(required = false) AiPromoRequest body) {
+    @PostMapping(value = "/ai-music", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> aiMusicStream(@RequestBody(required = false) AiPromoRequest body) {
         String tenantId = TenantContextHolder.currentTenantId();
         if (tenantId == null) {
             return Flux.error(new BizException(ErrorCode.MISSING_TENANT_ID));
@@ -68,17 +73,21 @@ public class DemoController {
             return Flux.error(new BizException(ErrorCode.INVALID_TENANT_ID,
                     "Request body must contain a non-blank 'topic' field"));
         }
-        if (body.duration() != null && !ALLOWED_DURATIONS.contains(body.duration())) {
+        if (body.duration() != null
+                && (body.duration() < MIN_DURATION_SEC || body.duration() > MAX_DURATION_SEC)) {
             return Flux.error(new BizException(ErrorCode.INVALID_VIDEO_DURATION,
-                    "duration must be 6 or 10 (Hailuo-2.3 constraint), got " + body.duration(),
-                    Map.of("duration", body.duration(), "allowed", ALLOWED_DURATIONS)));
+                    "duration must be between " + MIN_DURATION_SEC + " and "
+                            + MAX_DURATION_SEC + " seconds, got " + body.duration(),
+                    Map.of("duration", body.duration(),
+                            "min", MIN_DURATION_SEC,
+                            "max", MAX_DURATION_SEC)));
         }
 
-        log.info("demo.ai-promo.start tenant={} topic='{}' duration={}s language='{}'",
+        log.info("demo.ai-music.start tenant={} topic='{}' duration={}s language='{}'",
                 tenantId, body.topic(), body.duration(), body.language());
         return aiPromoDemoService.stream(body.topic(), body.duration(), body.language())
                 .map(this::toSseChunk)
-                .doOnError(err -> log.warn("demo.ai-promo.error tenant={} cause={}",
+                .doOnError(err -> log.warn("demo.ai-music.error tenant={} cause={}",
                         tenantId, err.getClass().getSimpleName()));
     }
 

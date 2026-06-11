@@ -3,7 +3,6 @@ package io.agentscope.router.business.tools;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
 import io.agentscope.router.business.multimodal.MultimodalService;
-import io.agentscope.router.business.multimodal.VideoTask;
 import io.agentscope.router.llm.core.ModelRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -119,7 +118,7 @@ public class MediaTools {
                 "cooldownRemainingMs", cooldownRemaining);
     }
 
-    // ---- multimodal (image / video) ------------------------------------
+    // ---- multimodal (image / music) ------------------------------------
 
     /**
      * Generate one or more images from a text prompt. Returns a JSON-friendly
@@ -152,74 +151,52 @@ public class MediaTools {
     }
 
     /**
-     * Submit an async text-to-video task. Returns the internal {@code taskId}
-     * (UUID); callers can poll with {@link #checkVideoStatus} or subscribe to
-     * the SSE stream on {@code GET /api/v1/media/video/{taskId}/stream}.
+     * Generate a music clip from structured lyrics + a style description.
+     * Synchronous: music-2.6 / music-2.6-free returns the audio bytes inline.
+     * The bytes are persisted to a temp file under
+     * {@code agentscope.demo.ai-promo.output-dir}; the returned {@code tempPath}
+     * is meant to be passed to {@code download_music_file} (in
+     * {@link PromoDemoTools}) so the bytes land in a user-visible path.
      */
-    @Tool(name = "text_to_video",
-          description = "Submit an asynchronous text-to-video task. Returns a JSON object "
-                  + "with 'taskId' (poll with check_video_status) and 'state' (initial PENDING, "
-                  + "transitions to QUEUED -> RUNNING -> SUCCEEDED or FAILED).")
-    public Map<String, Object> textToVideo(
-            @ToolParam(name = "prompt", required = true,
-                    description = "A short English description of the video.")
+    @Tool(name = "text_to_music",
+          description = "Generate a music clip from structured lyrics and a style "
+                  + "description using the registered music model (default "
+                  + "music-2.6-free). The lyrics MUST use section tags such as "
+                  + "[verse], [chorus], [bridge]. The prompt is a short English "
+                  + "style / genre / mood description (e.g. 'upbeat pop, ~10 seconds, "
+                  + "celebratory'). Returns a JSON object with 'tempPath' "
+                  + "(absolute path to the temp audio file in the router's "
+                  + "outputDir), 'model', 'fileSize' (bytes), 'audioLengthMs' "
+                  + "and 'fileExtension'. Pass tempPath to download_music_file "
+                  + "to copy it to a user-visible location.")
+    public Map<String, Object> textToMusic(
+            @ToolParam(name = "lyrics", required = true,
+                    description = "Structured lyrics with [verse]/[chorus]/[bridge] tags. "
+                            + "Keep total length under 800 characters.")
+            String lyrics,
+            @ToolParam(name = "prompt", required = false,
+                    description = "Optional style / genre / mood description in English "
+                            + "(e.g. 'upbeat pop, ~10 seconds, celebratory'). If omitted, "
+                            + "the configured agentscope.multimodal.minimax.music-prompt "
+                            + "default is used.")
             String prompt,
-            @ToolParam(name = "duration", required = false,
-                    description = "Optional duration in seconds (e.g. 6 or 10).")
-            Integer duration,
-            @ToolParam(name = "resolution", required = false,
-                    description = "Optional resolution (e.g. 768P or 1080P).")
-            String resolution,
+            @ToolParam(name = "model", required = false,
+                    description = "Optional music model id. Default: configured music-model "
+                            + "(music-2.6-free).")
+            String model,
             ToolContext ctx) {
-        log.info("tool.textToVideo tenant={} requestId={} prompt.len={} duration={} resolution={}",
-                ctx.tenantId(), ctx.requestId(),
-                prompt == null ? 0 : prompt.length(), duration, resolution);
-        VideoTask task = multimodal.submitVideoTask(
-                ctx.tenantId(), prompt, duration, resolution, null).block();
+        log.info("tool.textToMusic tenant={} requestId={} model={} prompt='{}' lyrics.len={}",
+                ctx.tenantId(), ctx.requestId(), model, prompt,
+                lyrics == null ? 0 : lyrics.length());
+        MultimodalService.MusicResult r = multimodal.generateMusic(
+                ctx.tenantId(), lyrics, model, prompt).block();
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("taskId", task.taskId());
-        out.put("state", task.state().name());
-        out.put("model", task.model());
-        out.put("createdAt", task.createdAt().toString());
+        out.put("tempPath", r.tempPath());
+        out.put("model", r.model());
+        out.put("fileSize", r.fileSize());
+        out.put("audioLengthMs", r.audioLengthMs());
+        out.put("fileExtension", r.fileExtension());
         return out;
-    }
-
-    /**
-     * Look up the current state of a previously submitted video task.
-     * Cross-tenant probes return a {@code found:false} payload rather than
-     * 404 to keep the LLM flow free of error handling.
-     */
-    @Tool(name = "check_video_status",
-          description = "Look up the current state of a video task by its taskId. "
-                  + "Returns state, videoUrl (when SUCCEEDED) and failureReason (when FAILED).")
-    public Map<String, Object> checkVideoStatus(
-            @ToolParam(name = "task_id", required = true,
-                    description = "The internal taskId returned by text_to_video.")
-            String taskId,
-            ToolContext ctx) {
-        log.info("tool.checkVideoStatus tenant={} requestId={} taskId={}",
-                ctx.tenantId(), ctx.requestId(), taskId);
-        return multimodal.getTask(ctx.tenantId(), taskId)
-                .<Map<String, Object>>map(t -> {
-                    Map<String, Object> m = new LinkedHashMap<>();
-                    m.put("found", true);
-                    m.put("taskId", t.taskId());
-                    m.put("state", t.state().name());
-                    m.put("videoUrl", t.videoUrl());
-                    m.put("fileId", t.fileId());
-                    m.put("providerTaskId", t.providerTaskId());
-                    m.put("failureReason", t.failureReason());
-                    m.put("createdAt", t.createdAt().toString());
-                    m.put("updatedAt", t.updatedAt().toString());
-                    return m;
-                })
-                .orElseGet(() -> {
-                    Map<String, Object> m = new LinkedHashMap<>();
-                    m.put("found", false);
-                    m.put("taskId", taskId);
-                    m.put("message", "No such video task for this tenant");
-                    return m;
-                });
     }
 
     /** DTO for {@link #listAvailableModels}. Public so the AgentScope schema

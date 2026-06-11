@@ -34,7 +34,8 @@ management:
 agentscope:
   routing:
     enabled: true
-    ttft-timeout-ms: 2000
+    # 真实 LLM 网关冷启动延迟通常 > 2s,这里放宽到 15s 避免首轮被误判为模型失败
+    ttft-timeout-ms: 15000
     health-window-size: 100
     ema-alpha: 0.3
     min-score-threshold: 0.05
@@ -51,9 +52,12 @@ agentscope:
       api-key: ${DASHSCOPE_API_KEY:}
       models: [qwen-plus]
     minimax:
-      enabled: false
+      enabled: true                 # 默认启用 minimax,所有 LLM 走 MiniMax-M3
       api-key: ${MINIMAX_API_KEY:}
-      base-url: ${MINIMAX_BASE_URL:https://api.minimaxi.com/v1}
+      # baseUrl 不能带 /v1 后缀:AgentScope OpenAIClient 的 buildApiUrl() 会把 baseUrl 末尾
+      # 的 /v\d+ 当作版本号,如果它已经在路径里就剥掉 endpoint 里的 /v1,导致最终 URL 变成
+      # https://api.minimaxi.com/chat/completions(404)。正确写法:让 OpenAIClient 自己补 /v1
+      base-url: ${MINIMAX_BASE_URL:https://api.minimaxi.com}
       protocol: openai-compatible
       models: [MiniMax-M3]
   tenants:
@@ -66,11 +70,19 @@ agentscope:
     max-iterations: 5
   demo:
     ai-promo:
-      enabled: false               # 关闭时不注册 AiPromoDemoService Bean,curl /api/v1/demo/ai-promo 直接 404
-      default-duration: 6          # curl 不传 duration 时的默认值
+      enabled: true                  # 默认开启,/api/v1/demo/ai-promo 可直接 curl
+      default-duration: 10           # curl 不传 duration 时的默认值(对应 10s 视频场景)
       default-resolution: 768P
       default-model: MiniMax-Hailuo-2.3
-      output-dir: ${DEMO_OUTPUT_DIR:business/src/main/resources/output}
+      output-dir: ${DEMO_OUTPUT_DIR:./agentscope-output}
+  multimodal:
+    enabled: true
+    minimax:
+      image-model: image-01
+      video-model: MiniMax-Hailuo-2.3
+      # music-2.6+ 端点用 prompt (style description) + lyrics,不要 refer_voice/audio_setting
+      music-model: music-2.6-free
+      music-prompt: "upbeat pop, suitable for a short promo, ~10 seconds"
 
 logging:
   # Log4j2 接管:详细 appender / pattern / 路由见 log4j2-spring.xml.

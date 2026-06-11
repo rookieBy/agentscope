@@ -26,27 +26,27 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Orchestrates the AI-promo demo end-to-end using THREE independent ReAct
+ * Orchestrates the AI-music demo end-to-end using THREE independent ReAct
  * agents coordinated via a {@link MsgHub}:
  *
  * <ol>
- *   <li>{@code copywriterAgent} — generates the script (pure LLM).</li>
- *   <li>{@code videoProducerAgent} — submits the video task and polls for
- *       completion (owns {@code MediaTools} video methods).</li>
- *   <li>{@code fileCollectorAgent} — downloads the finished .mp4 (owns
- *       {@code PromoDemoTools.download_video_file}).</li>
+ *   <li>{@code copywriterAgent} — generates the lyrics (pure LLM).</li>
+ *   <li>{@code musicProducerAgent} — calls {@code MediaTools.text_to_music}
+ *       once and broadcasts {@code MUSIC_READY: <tempPath>} to the hub.</li>
+ *   <li>{@code fileCollectorAgent} — copies the temp MP3 to a user-visible
+ *       path (owns {@code PromoDemoTools.download_music_file}).</li>
  * </ol>
  *
- * <p>The hub uses {@code autoBroadcast=true} so that the script produced by
- * the copywriter is automatically visible to the video producer when its
- * turn starts, and the video producer's "SUCCEEDED" summary is in turn
- * visible to the file collector.
+ * <p>The hub uses {@code autoBroadcast=true} so that the lyrics produced by
+ * the copywriter are automatically visible to the music producer when its
+ * turn starts, and the music producer's "MUSIC_READY: <path>" message is
+ * in turn visible to the file collector.
  *
  * <p>Per-request concerns:
  * <ul>
- *   <li>Builds the user message with {@code topic}, {@code duration},
- *       {@code saveTo} in metadata so the agents can read them without the
- *       LLM inventing values.</li>
+ *   <li>Builds the user message with {@code topic}, {@code duration}, and
+ *       a trailing "Save the final music to: <path>" line so the file
+ *       collector can find the destination without inventing values.</li>
  *   <li>Stamps a {@link ToolContext} into
  *       {@link MediaTools#setCurrentRequest} so tool invocations on Reactor
  *       worker threads can still resolve the active tenantId.</li>
@@ -70,16 +70,16 @@ public class AiPromoDemoService {
     private static final Logger log = LoggerFactory.getLogger(AiPromoDemoService.class);
 
     private final ReActAgent copywriterAgent;
-    private final ReActAgent videoProducerAgent;
+    private final ReActAgent musicProducerAgent;
     private final ReActAgent fileCollectorAgent;
     private final DemoProperties props;
 
     public AiPromoDemoService(ReActAgent copywriterAgent,
-                              ReActAgent videoProducerAgent,
+                              ReActAgent musicProducerAgent,
                               ReActAgent fileCollectorAgent,
                               DemoProperties props) {
         this.copywriterAgent = copywriterAgent;
-        this.videoProducerAgent = videoProducerAgent;
+        this.musicProducerAgent = musicProducerAgent;
         this.fileCollectorAgent = fileCollectorAgent;
         this.props = props;
     }
@@ -89,7 +89,7 @@ public class AiPromoDemoService {
      * surface it in 4xx error responses.
      */
     public Path resolveSavePath(int duration) {
-        return Paths.get(props.getOutputDir(), "ai-promo-" + duration + "s.mp4");
+        return Paths.get(props.getOutputDir(), "ai-music-" + duration + "s.mp3");
     }
 
     /**
@@ -123,7 +123,8 @@ public class AiPromoDemoService {
         msgs.add(Msg.builder()
                 .name("user")
                 .role(MsgRole.USER)
-                .textContent("Generate a " + dur + "-second promotional video about: " + topic)
+                .textContent("Generate a " + dur + "-second music about: " + topic
+                        + "\nSave the final music to: " + saveTo.toAbsolutePath())
                 .metadata(meta)
                 .build());
 
@@ -132,7 +133,7 @@ public class AiPromoDemoService {
         // on every terminal outcome (success, error, cancel).
         MsgHub hub = MsgHub.builder()
                 .name("promo-hub")
-                .participants(copywriterAgent, videoProducerAgent, fileCollectorAgent)
+                .participants(copywriterAgent, musicProducerAgent, fileCollectorAgent)
                 .enableAutoBroadcast(true)
                 .build();
 
@@ -149,7 +150,7 @@ public class AiPromoDemoService {
                                     tenantId, ctx.requestId(), activeHub.getParticipants().size());
                             return Flux.concat(
                                     copywriterAgent.stream(msgs, opts),
-                                    videoProducerAgent.stream(msgs, opts),
+                                    musicProducerAgent.stream(msgs, opts),
                                     fileCollectorAgent.stream(msgs, opts)
                             );
                         },

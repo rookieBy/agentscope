@@ -10,6 +10,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +29,7 @@ import java.util.Optional;
  *   <li>{@code POST /video_generation}  — async, returns a task id.</li>
  *   <li>{@code GET  /query/video_generation?task_id=...} — poll status.</li>
  *   <li>{@code GET  /files/retrieve?file_id=...} — exchange file id for a download URL.</li>
+ *   <li>{@code POST /music_generation}  — sync, returns inline audio bytes (music-01).</li>
  * </ul>
  *
  * <p>Authentication uses {@code Authorization: Bearer <api-key>} as per the
@@ -103,7 +105,7 @@ public class MiniMaxMultimodalClient {
         body.put("prompt_optimizer", props.getMinimax().isDefaultPromptOptimizer());
 
         return webClient.post()
-                .uri("/image_generation")
+                .uri("/v1/image_generation")
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
@@ -137,7 +139,7 @@ public class MiniMaxMultimodalClient {
         if (resolution != null && !resolution.isBlank()) body.put("resolution", resolution);
 
         return webClient.post()
-                .uri("/video_generation")
+                .uri("/v1/video_generation")
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(body)
                 .retrieve()
@@ -158,7 +160,7 @@ public class MiniMaxMultimodalClient {
             return Mono.error(new IllegalArgumentException("providerTaskId is required"));
         }
         return webClient.get()
-                .uri(uri -> uri.path("/query/video_generation")
+                .uri(uri -> uri.path("/v1/query/video_generation")
                         .queryParam("task_id", providerTaskId).build())
                 .retrieve()
                 .bodyToMono(Map.class)
@@ -174,7 +176,7 @@ public class MiniMaxMultimodalClient {
             return Mono.error(new IllegalArgumentException("fileId is required"));
         }
         return webClient.get()
-                .uri(uri -> uri.path("/files/retrieve")
+                .uri(uri -> uri.path("/v1/files/retrieve")
                         .queryParam("file_id", fileId).build())
                 .retrieve()
                 .bodyToMono(Map.class)
@@ -187,6 +189,71 @@ public class MiniMaxMultimodalClient {
                     throw new MiniMaxMultimodalException(
                             "minimax /files/retrieve returned no download_url; body=" + resp);
                 })
+                .onErrorMap(this::wrapHttpError);
+    }
+
+    // ---------- text -> music (synchronous) -------------------------------
+
+    /**
+     * Generate a piece of music from lyrics + a style description prompt.
+     * Returns the audio bytes (or a CDN URL to fetch) synchronously — music-2.6
+     * and music-2.6-free have no async task-id pattern like video. The caller
+     * is responsible for persisting the bytes / downloading the URL.
+     *
+     * <p><b>music-2.6 / music-2.6-free schema</b> (per
+     * {@code https://platform.minimaxi.com/docs/api-reference/music-generation}):
+     * <pre>{@code
+     *   { "model": "music-2.6-free",
+     *     "prompt": "upbeat pop, suitable for a short promo, ~10 seconds",
+     *     "lyrics": "[verse] ... [chorus] ..." }
+     * }</pre>
+     * Unlike the legacy music-01, music-2.6+ does NOT accept {@code refer_voice}
+     * or {@code audio_setting} — passing them yields {@code status_code=2013
+     * "cannot use music-01 params on music-1.5/2.6 model"}. The {@code prompt}
+     * (style / genre / mood description) is required.
+     *
+     * <p><b>Successful response shape</b>:
+     * <pre>{@code
+     *   { "data": { "model": "music-2.6-free",
+     *               "audio": "<hex string of mp3 bytes>",
+     *               "audio_url": "<signed cdn url>" (optional fallback),
+     *               "extra_info": { "music_duration": 25364,
+     *                               "music_sample_rate": 44100,
+     *                               "music_channel": 2,
+     *                               "bitrate": 256000,
+     *                               "music_size": 4115529 },
+     *               "file_extension": "mp3" },
+     *     "base_resp": { "status_code": 0, "status_msg": "success" } }
+     * }</pre>
+     * A {@code data.audio_url} (signed URL) is also accepted as a fallback
+     * if the API ever switches to URL-only responses.
+     */
+    public Mono<MusicResult> generateMusic(String model,
+                                           String prompt,
+                                           String lyrics) {
+        if (prompt == null || prompt.isBlank()) {
+            return Mono.error(new IllegalArgumentException(
+                    "prompt is required for music-2.6+ endpoints "
+                    + "(style / genre / mood description)"));
+        }
+        if (lyrics == null || lyrics.isBlank()) {
+            return Mono.error(new IllegalArgumentException("lyrics is required"));
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("model", (model == null || model.isBlank()) ? "music-2.6-free" : model);
+        body.put("prompt", prompt);
+        body.put("lyrics", lyrics);
+
+        return webClient.post()
+                .uri("/v1/music_generation")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(Map.class)
+                .map(this::toMusicResult)
+                .doOnNext(r -> log.info("minimax.music.generated model={} audioLenMs={} bytes={} ext={}",
+                        r.model(), r.audioLengthMs(), r.audioBytes() == null ? -1 : r.audioBytes().length,
+                        r.fileExtension()))
                 .onErrorMap(this::wrapHttpError);
     }
 
@@ -222,6 +289,90 @@ public class MiniMaxMultimodalClient {
             }
         }
         return new VideoPollResult(status, fileId);
+    }
+
+    /**
+     * Parse the synchronous music-generation response. The official docs at
+     * {@code https://platform.minimaxi.com/docs/api-reference/music-generation}
+     * describe the music-2.6+ shape (with {@code data.extra_info} carrying
+     * duration / sample-rate / bitrate / size). We also still read the
+     * legacy top-level {@code audio_length} / {@code file_size} /
+     * {@code file_extension} fields as a fallback:
+     * <pre>{@code
+     *   { "data": { "model": "music-2.6-free",
+     *               "audio": "<hex-encoded mp3 bytes>",
+     *               "extra_info": { "music_duration": 25364,
+     *                               "music_sample_rate": 44100,
+     *                               "music_channel": 2,
+     *                               "bitrate": 256000,
+     *                               "music_size": 4115529 } },
+     *     "base_resp": { "status_code": 0, "status_msg": "success" } }
+     * }</pre>
+     * A {@code data.audio_url} (signed URL) is also accepted as a fallback
+     * if the provider ever switches to URL-only delivery.
+     */
+    @SuppressWarnings("unchecked")
+    private MusicResult toMusicResult(Map<?, ?> resp) {
+        Object data = resp.get("data");
+        if (!(data instanceof Map<?, ?> dm)) {
+            throw new MiniMaxMultimodalException(
+                    "minimax /v1/music_generation returned unexpected body: " + resp);
+        }
+        Object baseResp = resp.get("base_resp");
+        if (baseResp instanceof Map<?, ?> br) {
+            Object code = br.get("status_code");
+            Object msg = br.get("status_msg");
+            if (code instanceof Number n && n.intValue() != 0) {
+                throw new MiniMaxMultimodalException(
+                        "minimax music API error " + code + " - " + msg);
+            }
+        }
+        String model = (String) dm.get("model");
+        byte[] audioBytes = null;
+        String audioUrl = null;
+        Object audioObj = dm.get("audio");
+        if (audioObj instanceof String hex && !hex.isBlank()) {
+            audioBytes = HexFormat.of().parseHex(hex);
+        } else {
+            Object urlObj = dm.get("audio_url");
+            if (urlObj instanceof String s && !s.isBlank()) {
+                audioUrl = s;
+            }
+        }
+        if (audioBytes == null && audioUrl == null) {
+            throw new MiniMaxMultimodalException(
+                    "minimax /v1/music_generation returned no audio or audio_url; body=" + resp);
+        }
+        // music-2.6+ packs audio metadata under data.extra_info; fall back
+        // to legacy top-level fields for older music-1.5 responses.
+        long audioLengthMs = 0L;
+        long fileSize = 0L;
+        long sampleRate = 0L;
+        long bitrate = 0L;
+        long channel = 0L;
+        Object extra = dm.get("extra_info");
+        if (extra instanceof Map<?, ?> ei) {
+            audioLengthMs = toLong(ei.get("music_duration"));
+            fileSize = toLong(ei.get("music_size"));
+            sampleRate = toLong(ei.get("music_sample_rate"));
+            bitrate = toLong(ei.get("bitrate"));
+            channel = toLong(ei.get("music_channel"));
+        }
+        if (audioLengthMs == 0L) audioLengthMs = toLong(dm.get("audio_length"));
+        if (fileSize == 0L) fileSize = toLong(dm.get("file_size"));
+        if (audioBytes != null) fileSize = fileSize == 0L ? audioBytes.length : fileSize;
+        String fileExtension = Optional.ofNullable((String) dm.get("file_extension"))
+                .filter(s -> !s.isBlank()).orElse("mp3");
+        return new MusicResult(model, audioBytes, audioUrl, audioLengthMs, fileSize,
+                sampleRate, bitrate, channel, fileExtension);
+    }
+
+    private static long toLong(Object o) {
+        if (o instanceof Number n) return n.longValue();
+        if (o instanceof String s) {
+            try { return Long.parseLong(s); } catch (NumberFormatException ignored) { /* fall through */ }
+        }
+        return 0L;
     }
 
     private Throwable wrapHttpError(Throwable err) {
@@ -271,6 +422,47 @@ public class MiniMaxMultimodalClient {
         public static final String STATUS_PROCESSING = "Processing";
         public static final String STATUS_SUCCESS = "Success";
         public static final String STATUS_FAIL = "Fail";
+    }
+
+    /**
+     * Audio-generation parameters for the legacy music-01 / music-02 API.
+     * The {@code format} field must be one of {@code mp3}, {@code pcm},
+     * {@code flac} (per the spec); bitrate is ignored for lossless formats.
+     *
+     * @deprecated music-2.6+ does not accept {@code audio_setting}. The
+     * record is kept so the public API does not break for callers that
+     * still hold a reference; {@link #generateMusic} ignores it.
+     */
+    @Deprecated
+    public record AudioSetting(int sampleRate, int bitrate, String format) {
+        /** Sensible default for music-01: 44.1 kHz, 256 kbps CBR, mp3. */
+        public static AudioSetting mp3() {
+            return new AudioSetting(44100, 256000, "mp3");
+        }
+    }
+
+    /**
+     * Successful response from {@code /v1/music_generation}. Exactly one of
+     * {@code audioBytes} and {@code audioUrl} is non-null: music-2.6-free
+     * currently returns inline hex bytes; if the provider ever switches to
+     * signed-URL delivery only, the {@code audioUrl} field is populated and
+     * the caller is responsible for fetching the bytes.
+     *
+     * <p>Newer fields {@code sampleRateHz} / {@code bitrate} / {@code channel}
+     * are populated from {@code data.extra_info} for music-2.6+; they will
+     * be {@code 0} for older music-1.5 responses that don't include the
+     * block.
+     */
+    public record MusicResult(String model,
+                              byte[] audioBytes,
+                              String audioUrl,
+                              long audioLengthMs,
+                              long fileSize,
+                              long sampleRateHz,
+                              long bitrate,
+                              long channel,
+                              String fileExtension) {
+        public boolean hasInlineBytes() { return audioBytes != null; }
     }
 
     /** Wraps HTTP / parse errors from the minimax multimodal API. */

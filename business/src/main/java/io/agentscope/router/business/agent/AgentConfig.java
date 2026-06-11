@@ -18,7 +18,7 @@ import org.springframework.context.annotation.Configuration;
 
 /**
  * Wires the ReAct agents that back the agent-mode chat endpoint and the
- * AI-promo demo.
+ * AI-music demo.
  *
  * <p><b>Production path</b> ({@code /api/v1/chat/agent/stream}) uses TWO
  * independent ReAct agents coordinated via a {@code MsgHub} at request time:
@@ -31,13 +31,12 @@ import org.springframework.context.annotation.Configuration;
  *       and recommends the best model.</li>
  * </ul>
  *
- * <p><b>Demo path</b> ({@code /api/v1/demo/ai-promo}) uses THREE independent
+ * <p><b>Demo path</b> ({@code /api/v1/demo/ai-music}) uses THREE independent
  * ReAct agents, again coordinated by a {@code MsgHub}:
  * <ul>
- *   <li>{@code copywriterAgent} — pure-LLM, no tools. Generates the script.</li>
- *   <li>{@code videoProducerAgent} — owns {@code MediaTools} video methods
- *       ({@code text_to_video}, {@code check_video_status}).</li>
- *   <li>{@code fileCollectorAgent} — owns {@code PromoDemoTools.download_video_file}.</li>
+ *   <li>{@code copywriterAgent} — pure-LLM, no tools. Generates the lyrics.</li>
+ *   <li>{@code musicProducerAgent} — owns {@code MediaTools.text_to_music}.</li>
+ *   <li>{@code fileCollectorAgent} — owns {@code PromoDemoTools.download_music_file}.</li>
  * </ul>
  * The three demo agents are gated on
  * {@code agentscope.demo.ai-promo.enabled=true} (typically the smoke profile).
@@ -101,8 +100,9 @@ public class AgentConfig {
                              user.
 
                         Do NOT recommend a model yourself. That is the
-                        advisor's job. Do NOT call text_to_image, text_to_video,
-                        or any video tools — those are not part of routing.
+                        advisor's job. Do NOT call text_to_image, text_to_music,
+                        or any media-generation tools — those are not part of
+                        routing.
                         """)
                 .maxIters(5)
                 .build();
@@ -147,24 +147,24 @@ public class AgentConfig {
     // ---- demo (3 agents, 2 toolkits) -----------------------------------
 
     /**
-     * Demo toolkit for the video producer agent. Registers {@link MediaTools}
-     * (its {@code text_to_video} and {@code check_video_status} methods).
-     * Gated on {@code agentscope.demo.ai-promo.enabled=true}.
+     * Demo toolkit for the music producer agent. Registers {@link MediaTools}
+     * (its {@code text_to_music} method). Gated on
+     * {@code agentscope.demo.ai-promo.enabled=true}.
      */
     @Bean
     @ConditionalOnProperty(prefix = "agentscope.demo.ai-promo", name = "enabled", havingValue = "true")
-    public Toolkit videoProducerToolkit(MediaTools mediaTools) {
+    public Toolkit musicProducerToolkit(MediaTools mediaTools) {
         ToolkitConfig config = ToolkitConfig.builder().build();
         Toolkit toolkit = new Toolkit(config);
         toolkit.registerTool(mediaTools);
-        log.info("Registered videoProducer toolkit with {} tool(s): {}",
+        log.info("Registered musicProducer toolkit with {} tool(s): {}",
                 toolkit.getToolNames().size(), toolkit.getToolNames());
         return toolkit;
     }
 
     /**
      * Demo toolkit for the file collector agent. Registers {@link PromoDemoTools}
-     * (its {@code download_video_file} method). Gated on
+     * (its {@code download_music_file} method). Gated on
      * {@code agentscope.demo.ai-promo.enabled=true}.
      */
     @Bean
@@ -179,8 +179,8 @@ public class AgentConfig {
     }
 
     /**
-     * Demo agent #1: copywriter. Pure LLM, no tools. Generates the script
-     * that the next agent in the hub will hand to the video API.
+     * Demo agent #1: copywriter. Pure LLM, no tools. Generates the lyrics
+     * that the next agent in the hub will hand to the music API.
      */
     @Bean
     @ConditionalOnProperty(prefix = "agentscope.demo.ai-promo", name = "enabled", havingValue = "true")
@@ -190,89 +190,89 @@ public class AgentConfig {
                 .build();
         return ReActAgent.builder()
                 .name("copywriter")
-                .description("Generates a vivid scene-by-scene promotional script.")
+                .description("Writes structured lyrics with [verse]/[chorus] section tags.")
                 .model(routingChatModel)
                 .toolExecutionContext(agentToolContext)
                 .sysPrompt("""
-                        You are the copywriter in a 3-agent AI-promo team.
+                        You are a songwriter for short music promos. You will
+                        receive a topic and a target duration in seconds from
+                        the user. Produce structured lyrics in the user's
+                        original language with explicit section tags: [verse],
+                        [chorus], optional [bridge].
 
-                        Read the user's request from the conversation. Generate
-                        a vivid, scene-by-scene English script of 3-5 scenes
-                        that together feel like a promotional clip:
+                        Keep total length under 800 characters. Make the lyrics
+                        rhyme where natural, but prioritize keeping the message
+                        on-topic.
 
-                          - Embed minimax-compatible camera commands in square
-                            brackets where they add visual interest, e.g.
-                            [Push in], [Pan left], [Static shot], [Zoom out].
-                            Use at most one command per scene.
-                          - Output language: read the 'language' field from the
-                            user message's metadata (default 'en').
-                          - Honour the 'duration' field from the user message's
-                            metadata to decide scene length.
-                          - Return ONLY the script. No preamble, no markdown,
-                            no closing line.
-
-                        Your output will be consumed by the next agent on the
-                        hub (video producer), which will use it verbatim as
-                        the prompt for text_to_video.
+                        Do NOT call any tool. Output ONLY the lyrics, no
+                        commentary or explanation. The next agent will pick
+                        up your lyrics from the message hub.
                         """)
                 .maxIters(2)
                 .build();
     }
 
     /**
-     * Demo agent #2: video producer. Owns the {@code MediaTools} video
-     * methods. Reads the script published by {@code copywriterAgent} on the
-     * hub, submits a video task, polls for completion.
+     * Demo agent #2: music producer. Owns {@code MediaTools.text_to_music}.
+     * Reads the lyrics published by {@code copywriterAgent} on the hub,
+     * calls the synchronous music-2.6-free API, and broadcasts the resulting
+     * tempPath to the hub.
      */
     @Bean
     @ConditionalOnProperty(prefix = "agentscope.demo.ai-promo", name = "enabled", havingValue = "true")
-    public ReActAgent videoProducerAgent(RoutingChatModel routingChatModel,
-                                          Toolkit videoProducerToolkit) {
+    public ReActAgent musicProducerAgent(RoutingChatModel routingChatModel,
+                                          Toolkit musicProducerToolkit) {
         ToolExecutionContext agentToolContext = ToolExecutionContext.builder()
                 .addStore(new RequestContextStore())
                 .build();
         return ReActAgent.builder()
-                .name("video-producer")
-                .description("Submits async text-to-video tasks and polls for completion.")
+                .name("music-producer")
+                .description("Generates a music clip from structured lyrics via text_to_music.")
                 .model(routingChatModel)
-                .toolkit(videoProducerToolkit)
+                .toolkit(musicProducerToolkit)
                 .toolExecutionContext(agentToolContext)
                 .sysPrompt("""
-                        You are the video producer in a 3-agent AI-promo team.
+                        You are a music producer in a 3-agent music-promo pipeline.
 
-                        EXACT WORKFLOW:
-                          STEP 1. Read the script that the copywriter agent
-                                  just published on the shared MsgHub. Use it
-                                  verbatim as the 'prompt' for text_to_video.
-                          STEP 2. Call text_to_video with:
-                                  - prompt: the copywriter's script (use as-is,
-                                    do not edit).
-                                  - duration: read the 'duration' field from
-                                    the user message's metadata. Allowed
-                                    values are 6 or 10. If the user asked
-                                    for something else, fall back to 6.
-                                  - resolution: 768P.
-                          STEP 3. From the text_to_video response, take the
-                                  'taskId' field. Repeatedly call
-                                  check_video_status until the state is
-                                  SUCCEEDED or FAILED.
-                          STEP 4. On SUCCEEDED, publish a short summary
-                                  message to the hub naming the taskId and
-                                  'state=SUCCEEDED'. On FAILED, publish the
-                                  failure_reason verbatim.
+                        You will see structured lyrics from the copywriter on
+                        the shared message hub. Your job is to call the
+                        `text_to_music` tool EXACTLY ONCE with those lyrics.
 
-                        Do NOT call download_video_file — that is the file
-                        collector's job. Do NOT generate a script — that is
-                        the copywriter's job.
+                        Tool: text_to_music(lyrics: string, prompt: string optional, model: string optional)
+                          - Pass the full lyrics text into `lyrics`.
+                          - Set `prompt` to a short English style / genre /
+                            mood description that fits the lyrics topic.
+                            Example: for a World Cup France team promo, use
+                            "upbeat pop, celebratory, ~10 seconds, energetic
+                            vocals". The `prompt` is REQUIRED in spirit (the
+                            provider's music-2.6+ endpoint refuses requests
+                            without it), so always fill it in with something
+                            sensible rather than leaving it blank.
+                          - Leave `model` empty to use the default
+                            music-2.6-free.
+                          - The tool returns a map with `tempPath` (absolute
+                            path to the generated MP3).
+
+                        After the tool returns successfully, post EXACTLY this
+                        message to the hub:
+                          MUSIC_READY: <tempPath>
+
+                        Where <tempPath> is the value of the `tempPath` field
+                        from the tool response.
+
+                        Then stop. Do NOT retry on success. Do NOT poll. Do
+                        NOT call any other tool. If the tool fails, surface
+                        the error message and stop.
                         """)
-                .maxIters(8)
+                .maxIters(3)
                 .build();
     }
 
     /**
-     * Demo agent #3: file collector. Owns {@code PromoDemoTools.download_video_file}.
-     * Reads the SUCCEEDED task from the hub and writes the .mp4 to the path
-     * in the user message's metadata.
+     * Demo agent #3: file collector. Owns {@code PromoDemoTools.download_music_file}.
+     * Reads the {@code MUSIC_READY: <tempPath>} message from the hub and
+     * copies the temp MP3 to the user-visible save path announced in the
+     * task brief.
      */
     @Bean
     @ConditionalOnProperty(prefix = "agentscope.demo.ai-promo", name = "enabled", havingValue = "true")
@@ -283,29 +283,29 @@ public class AgentConfig {
                 .build();
         return ReActAgent.builder()
                 .name("file-collector")
-                .description("Downloads the completed promo video to the user's output path.")
+                .description("Copies the generated music file from temp dir to the user's output path.")
                 .model(routingChatModel)
                 .toolkit(fileCollectorToolkit)
                 .toolExecutionContext(agentToolContext)
                 .sysPrompt("""
-                        You are the file collector in a 3-agent AI-promo team.
+                        You are a file collector for the music-promo pipeline.
 
-                        EXACT WORKFLOW:
-                          STEP 1. Read the video producer agent's summary on
-                                  the hub. Extract the 'taskId'.
-                          STEP 2. Read the user message's metadata to find
-                                  'saveTo' — that is where the .mp4 must be
-                                  written.
-                          STEP 3. Call download_video_file with:
-                                  - task_id: the taskId from step 1.
-                                  - save_to: the saveTo from step 2.
-                          STEP 4. On success, reply in one short sentence
-                                  naming the saved file path. On failure,
-                                  surface the tool's error message verbatim.
+                        You watch the shared message hub. When you see a
+                        message starting with "MUSIC_READY: ", extract the
+                        absolute path that follows.
 
-                        Do NOT call text_to_video or check_video_status —
-                        those are the video producer's tools. Do NOT
-                        regenerate the script.
+                        Then call `download_music_file(audioPath, saveTo)`:
+                          - audioPath = the path extracted from the MUSIC_READY
+                            message.
+                          - saveTo = the absolute save path provided in your
+                            task brief (look for a line like
+                            "Save the final music to: <path>").
+
+                        When the tool returns the saved path, post EXACTLY
+                        this message to the hub:
+                          SAVED: <returned-path>
+
+                        Then stop. Do NOT call any other tool.
                         """)
                 .maxIters(3)
                 .build();
